@@ -1,0 +1,153 @@
+# Runs evaluation against golden dataset, gates on score threshold,
+# promotes prompt version from dev to staging if score passes.
+# This is the CI gate that makes Phase 4 prompt management meaningful.
+
+name: Prompt Promotion
+
+on:
+  workflow_dispatch:
+    inputs:
+      prompt_id:
+        description: "Prompt ID to promote"
+        required: true
+        default: "rag-system-prompt"
+      from_version:
+        description: "Version to promote"
+        required: true
+        default: "1"
+      from_env:
+        description: "Source environment"
+        required: true
+        default: "dev"
+        type: choice
+        options: [dev, staging]
+      to_env:
+        description: "Target environment"
+        required: true
+        default: "staging"
+        type: choice
+        options: [staging, prod]
+      score_threshold:
+        description: "Minimum eval score (0.0-1.0)"
+        required: true
+        default: "0.70"
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  AWS_REGION: "us-east-1"
+  AWS_ACCOUNT_ID: "011528270076"
+
+jobs:
+  evaluate-and-promote:
+    name: Evaluate → Gate → Promote
+    runs-on: ubuntu-latest
+    environment: ${{ github.event.inputs.to_env }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::${{ env.AWS_ACCOUNT_ID }}:role/llmops-bedrock-dev-github-actions-role
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install boto3 requests
+
+      - name: Run evaluation pipeline
+        id: eval
+        env:
+          EVAL_TABLE:     llmops-bedrock-dev-eval-results
+          EVAL_BUCKET:    llmops-bedrock-dev-eval-datasets
+          PROMPT_VERSION: ${{ github.event.inputs.from_version }}
+          PASS_THRESHOLD: ${{ github.event.inputs.score_threshold }}
+          API_ENDPOINT:   ${{ secrets.API_ENDPOINT }}
+        run: |
+          cd evaluation
+          python evaluator.py > eval_output.json 2>&1 || true
+          cat eval_output.json
+
+          # Extract score for gate check
+          SCORE=$(python3 -c "
+          import json, sys
+          try:
+              data = json.load(open('eval_output.json'))
+              print(data.get('avg_score', 0))
+          except:
+              print(0)
+          ")
+          echo "score=$SCORE" >> $GITHUB_OUTPUT
+          echo "Eval score: $SCORE"
+
+      - name: Eval gate check
+        id: gate
+        run: |
+          SCORE="${{ steps.eval.outputs.score }}"
+          THRESHOLD="${{ github.event.inputs.score_threshold }}"
+
+          python3 -c "
+          score = float('$SCORE')
+          threshold = float('$THRESHOLD')
+          if score < threshold:
+              print(f'GATE FAILED: score {score} < threshold {threshold}')
+              exit(1)
+          else:
+              print(f'GATE PASSED: score {score} >= threshold {threshold}')
+          "
+
+      - name: Promote prompt version
+        if: steps.gate.outcome == 'success'
+        run: |
+          python3 << 'PYEOF'
+          import boto3, json
+          from datetime import datetime, timezone
+
+          dynamodb = boto3.resource("dynamodb", region_name="us-east-1")
+          table    = dynamodb.Table("llmops-bedrock-dev-prompt-registry")
+
+          # Get source item
+          response = table.get_item(Key={
+              "prompt_id": "${{ github.event.inputs.prompt_id }}",
+              "version":   "${{ github.event.inputs.from_version }}"
+          })
+          source = response.get("Item", {})
+
+          if not source:
+              print("Source prompt not found")
+              exit(1)
+
+          # Write to target environment
+          promoted = {**source,
+              "environment":   "${{ github.event.inputs.to_env }}",
+              "status":        "active",
+              "promoted_at":   datetime.now(timezone.utc).isoformat(),
+              "promoted_from": "${{ github.event.inputs.from_env }}",
+              "promoted_by":   "github-actions",
+              "eval_score":    "${{ steps.eval.outputs.score }}"
+          }
+
+          table.put_item(Item=promoted)
+          print(f"Promoted {source['prompt_id']} v{source['version']} "
+                f"from ${{ github.event.inputs.from_env }} "
+                f"to ${{ github.event.inputs.to_env }}")
+          PYEOF
+
+      - name: Post promotion summary
+        if: always()
+        run: |
+          echo "## Prompt Promotion Summary" >> $GITHUB_STEP_SUMMARY
+          echo "- **Prompt:** ${{ github.event.inputs.prompt_id }} v${{ github.event.inputs.from_version }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Route:** ${{ github.event.inputs.from_env }} → ${{ github.event.inputs.to_env }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Eval Score:** ${{ steps.eval.outputs.score }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Threshold:** ${{ github.event.inputs.score_threshold }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Gate:** ${{ steps.gate.outcome }}" >> $GITHUB_STEP_SUMMARY

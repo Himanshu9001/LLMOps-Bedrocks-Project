@@ -1,0 +1,119 @@
+# Builds FastAPI container, pushes to ECR, rolls out to EKS.
+# Triggered on changes to services/api/ or k8s/ manifests.
+# Uses OIDC — no hardcoded AWS keys.
+
+name: API Deploy
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "services/api/**"
+      - "services/agents/**"
+      - "k8s/**"
+  workflow_dispatch:
+    inputs:
+      force_deploy:
+        description: "Force deploy even without code changes"
+        type: boolean
+        default: false
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  AWS_REGION: "us-east-1"
+  ECR_REPOSITORY: "llmops-bedrock-dev-api"
+  EKS_CLUSTER: "llmops-bedrock-dev"
+  K8S_NAMESPACE: "llmops"
+  AWS_ACCOUNT_ID: "011528270076"
+
+jobs:
+  build-and-deploy:
+    name: Build, Push, Deploy
+    runs-on: ubuntu-latest
+    environment: dev
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::${{ env.AWS_ACCOUNT_ID }}:role/llmops-bedrock-dev-github-actions-role
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Set image tag
+        id: tag
+        run: |
+          # Use short SHA for traceability — every image traceable to a commit
+          echo "IMAGE_TAG=${{ github.sha }}" >> $GITHUB_OUTPUT
+          echo "IMAGE_URI=${{ env.AWS_ACCOUNT_ID }}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com/${{ env.ECR_REPOSITORY }}" >> $GITHUB_OUTPUT
+
+      - name: Build Docker image
+        run: |
+          docker buildx build \
+            --platform linux/amd64 \
+            --provenance=false \
+            --sbom=false \
+            --output type=image,push=false,oci-mediatypes=false \
+            --load \
+            -t ${{ steps.tag.outputs.IMAGE_URI }}:${{ steps.tag.outputs.IMAGE_TAG }} \
+            -t ${{ steps.tag.outputs.IMAGE_URI }}:latest \
+            services/api/
+
+      - name: Run Trivy security scan
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: "${{ steps.tag.outputs.IMAGE_URI }}:${{ steps.tag.outputs.IMAGE_TAG }}"
+          format: "table"
+          exit-code: "0"           # Don't block on vulns for now — log only
+          severity: "CRITICAL,HIGH"
+
+      - name: Push image to ECR
+        run: |
+          docker push ${{ steps.tag.outputs.IMAGE_URI }}:${{ steps.tag.outputs.IMAGE_TAG }}
+          docker push ${{ steps.tag.outputs.IMAGE_URI }}:latest
+
+      - name: Update kubeconfig
+        run: |
+          aws eks update-kubeconfig \
+            --region ${{ env.AWS_REGION }} \
+            --name ${{ env.EKS_CLUSTER }}
+
+      - name: Deploy to EKS
+        run: |
+          # Apply k8s manifests
+          kubectl apply -f k8s/namespace.yaml
+          kubectl apply -f k8s/serviceaccount.yaml
+          kubectl apply -f k8s/fastapi.yaml
+          kubectl apply -f k8s/hpa.yaml
+
+          # Update image to use SHA tag — not latest, for determinism
+          kubectl set image deployment/fastapi \
+            fastapi=${{ steps.tag.outputs.IMAGE_URI }}:${{ steps.tag.outputs.IMAGE_TAG }} \
+            -n ${{ env.K8S_NAMESPACE }}
+
+          # Wait for rollout to complete — fail CI if pods don't come up
+          kubectl rollout status deployment/fastapi \
+            -n ${{ env.K8S_NAMESPACE }} \
+            --timeout=300s
+
+      - name: Verify deployment
+        run: |
+          kubectl get pods -n ${{ env.K8S_NAMESPACE }}
+          echo "Deployed image: ${{ steps.tag.outputs.IMAGE_URI }}:${{ steps.tag.outputs.IMAGE_TAG }}"
+
+      - name: Post deployment summary
+        run: |
+          echo "## Deployment Summary" >> $GITHUB_STEP_SUMMARY
+          echo "- **Image:** ${{ steps.tag.outputs.IMAGE_URI }}:${{ steps.tag.outputs.IMAGE_TAG }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Cluster:** ${{ env.EKS_CLUSTER }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Namespace:** ${{ env.K8S_NAMESPACE }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Commit:** ${{ github.sha }}" >> $GITHUB_STEP_SUMMARY
