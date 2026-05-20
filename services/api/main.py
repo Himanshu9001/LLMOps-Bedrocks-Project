@@ -51,6 +51,50 @@ REDIS_PORT  = int(os.environ.get("REDIS_PORT", "6379"))
 SESSION_TTL = int(os.environ.get("SESSION_TTL", "1800"))
 CW_NAMESPACE = "LLMOps/Bedrock"
 
+# ── Guardrail config ──────────────────────────────────────────────────────────
+GUARDRAIL_ID      = os.environ.get("GUARDRAIL_ID", "")
+GUARDRAIL_VERSION = os.environ.get("GUARDRAIL_VERSION", "1")
+
+INJECTION_PATTERNS = [
+    "ignore previous instructions", "ignore prior instructions",
+    "disregard your system prompt", "disregard system prompt",
+    "you are now", "forget your instructions",
+    "act as if you are", "pretend you are",
+    "override your", "bypass your", "jailbreak", "dan mode",
+]
+
+bedrock_runtime = boto3.client(
+    "bedrock-runtime",
+    region_name=os.environ.get("AWS_REGION", "us-east-1")
+)
+
+
+def check_prompt_injection(text: str) -> bool:
+    """Fast pattern-based injection check — first line of defense, ~0ms."""
+    return any(p in text.lower() for p in INJECTION_PATTERNS)
+
+
+def apply_guardrail(text: str, source: str = "INPUT") -> dict:
+    """Applies Bedrock Guardrail — second line of defense, semantic check."""
+    if not GUARDRAIL_ID:
+        return {"action": "NONE", "output": text}
+    try:
+        response = bedrock_runtime.apply_guardrail(
+            guardrailIdentifier=GUARDRAIL_ID,
+            guardrailVersion=GUARDRAIL_VERSION,
+            source=source,
+            content=[{"text": {"text": text}}]
+        )
+        action = response.get("action", "NONE")
+        if action == "GUARDRAIL_INTERVENED":
+            outputs = response.get("outputs", [])
+            blocked_msg = outputs[0]["text"] if outputs else "Content blocked by guardrail"
+            return {"action": action, "output": blocked_msg}
+        return {"action": "NONE", "output": text}
+    except Exception as e:
+        logger.warning(f"Guardrail check failed: {e}")
+        return {"action": "NONE", "output": text}
+
 # ── In-memory latency buffer for percentile calculation ───────────────────────
 # Keeps last 1000 latency values — percentiles computed per flush
 _latency_buffer = deque(maxlen=1000)
@@ -218,6 +262,17 @@ async def query(req: QueryRequest):
     session_id = req.session_id or str(uuid.uuid4())
     start      = datetime.now(timezone.utc)
     success    = True
+
+    # Layer 1: fast pattern injection check
+    if check_prompt_injection(req.query):
+        logger.warning(f"Prompt injection detected: tenant={req.tenant_id}")
+        raise HTTPException(status_code=400, detail="Request contains prohibited content.")
+
+    # Layer 2: Bedrock Guardrail semantic check
+    guardrail_result = apply_guardrail(req.query, source="INPUT")
+    if guardrail_result["action"] == "GUARDRAIL_INTERVENED":
+        logger.warning(f"Guardrail blocked input: tenant={req.tenant_id}")
+        raise HTTPException(status_code=400, detail=guardrail_result["output"])
 
     trace = langfuse.trace(
         name="rag-query",
