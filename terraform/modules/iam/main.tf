@@ -1,16 +1,11 @@
-# IAM Module — 4 roles: GitHub Actions OIDC, Bedrock invocation, Lambda execution, IRSA for EKS FastAPI pod
-
 data "aws_caller_identity" "current" {}
 data "aws_region" "current" {}
 
 # ── 1. GitHub Actions OIDC Role ───────────────────────────────────────────────
-# Allows GitHub Actions CI/CD to assume this role via OIDC — no static AWS keys needed
-
 resource "aws_iam_openid_connect_provider" "github" {
   url             = "https://token.actions.githubusercontent.com"
   client_id_list  = ["sts.amazonaws.com"]
   thumbprint_list = ["6938fd4d98bab03faadb97b34396831e3780aea1"]
-
   tags = merge(var.common_tags, { Name = "${var.project}-${var.env}-github-oidc" })
 }
 
@@ -25,7 +20,6 @@ resource "aws_iam_role" "github_actions" {
       Action    = "sts:AssumeRoleWithWebIdentity"
       Condition = {
         StringLike = {
-          # Scoped to your repo only — prevents other GitHub repos assuming this role
           "token.actions.githubusercontent.com:sub" = "repo:${var.github_org}/${var.github_repo}:*"
         }
         StringEquals = {
@@ -38,7 +32,6 @@ resource "aws_iam_role" "github_actions" {
   tags = merge(var.common_tags, { Name = "${var.project}-${var.env}-github-actions-role" })
 }
 
-# Permissions for GitHub Actions — Terraform plan/apply + ECR push
 resource "aws_iam_role_policy" "github_actions" {
   name = "${var.project}-${var.env}-github-actions-policy"
   role = aws_iam_role.github_actions.id
@@ -47,7 +40,6 @@ resource "aws_iam_role_policy" "github_actions" {
     Version = "2012-10-17"
     Statement = [
       {
-        # Terraform state read/write
         Effect   = "Allow"
         Action   = ["s3:GetObject", "s3:PutObject", "s3:DeleteObject", "s3:ListBucket"]
         Resource = [
@@ -56,13 +48,11 @@ resource "aws_iam_role_policy" "github_actions" {
         ]
       },
       {
-        # S3 lock file for state locking
         Effect   = "Allow"
         Action   = ["s3:PutObject", "s3:DeleteObject", "s3:GetObject"]
         Resource = "arn:aws:s3:::${var.project}-tfstate/*.tflock"
       },
       {
-        # ECR push for FastAPI image — Phase 3
         Effect   = "Allow"
         Action   = ["ecr:GetAuthorizationToken", "ecr:BatchCheckLayerAvailability",
                     "ecr:PutImage", "ecr:InitiateLayerUpload", "ecr:UploadLayerPart",
@@ -73,9 +63,32 @@ resource "aws_iam_role_policy" "github_actions" {
   })
 }
 
-# ── 2. Bedrock Invocation Role ────────────────────────────────────────────────
-# Least-privilege: scoped to specific model ARNs only — not bedrock:*
+# ── 2. Managed Bedrock Policy — shared across roles ───────────────────────────
+# Includes both foundation model ARNs and inference profile ARNs
+# Claude 4.x requires inference profile (us. prefix) for actual invocation
+resource "aws_iam_policy" "bedrock_invoke_managed" {
+  name = "${var.project}-${var.env}-bedrock-invoke-managed"
 
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect = "Allow"
+      Action = ["bedrock:InvokeModel", "bedrock:InvokeModelWithResponseStream"]
+      Resource = [
+        "arn:aws:bedrock:${data.aws_region.current.name}::foundation-model/anthropic.claude-sonnet-4-5-20250929-v1:0",
+        "arn:aws:bedrock:${data.aws_region.current.name}::foundation-model/anthropic.claude-haiku-4-5-20251001-v1:0",
+        "arn:aws:bedrock:${data.aws_region.current.name}::foundation-model/anthropic.claude-opus-4-6-v1",
+        "arn:aws:bedrock:${data.aws_region.current.name}:${data.aws_caller_identity.current.account_id}:inference-profile/us.anthropic.claude-sonnet-4-5-20250929-v1:0",
+        "arn:aws:bedrock:${data.aws_region.current.name}:${data.aws_caller_identity.current.account_id}:inference-profile/us.anthropic.claude-haiku-4-5-20251001-v1:0",
+        "arn:aws:bedrock:${data.aws_region.current.name}:${data.aws_caller_identity.current.account_id}:inference-profile/us.anthropic.claude-opus-4-6-v1"
+      ]
+    }]
+  })
+
+  tags = var.common_tags
+}
+
+# ── 3. Bedrock Invocation Role ────────────────────────────────────────────────
 resource "aws_iam_role" "bedrock_invoke" {
   name = "${var.project}-${var.env}-bedrock-invoke-role"
 
@@ -99,23 +112,23 @@ resource "aws_iam_role_policy" "bedrock_invoke" {
     Version = "2012-10-17"
     Statement = [
       {
-        # Scoped to Claude Sonnet, Haiku, Nova Pro only — not all Bedrock models
         Effect = "Allow"
         Action = ["bedrock:InvokeModel", "bedrock:InvokeModelWithResponseStream"]
         Resource = [
-          "arn:aws:bedrock:${data.aws_region.current.name}::foundation-model/anthropic.claude-3-5-sonnet-20241022-v2:0",
-          "arn:aws:bedrock:${data.aws_region.current.name}::foundation-model/anthropic.claude-3-haiku-20240307-v1:0",
-          "arn:aws:bedrock:${data.aws_region.current.name}::foundation-model/amazon.nova-pro-v1:0"
+          "arn:aws:bedrock:${data.aws_region.current.name}::foundation-model/anthropic.claude-sonnet-4-5-20250929-v1:0",
+          "arn:aws:bedrock:${data.aws_region.current.name}::foundation-model/anthropic.claude-haiku-4-5-20251001-v1:0",
+          "arn:aws:bedrock:${data.aws_region.current.name}::foundation-model/anthropic.claude-opus-4-6-v1",
+          "arn:aws:bedrock:${data.aws_region.current.name}:${data.aws_caller_identity.current.account_id}:inference-profile/us.anthropic.claude-sonnet-4-5-20250929-v1:0",
+          "arn:aws:bedrock:${data.aws_region.current.name}:${data.aws_caller_identity.current.account_id}:inference-profile/us.anthropic.claude-haiku-4-5-20251001-v1:0",
+          "arn:aws:bedrock:${data.aws_region.current.name}:${data.aws_caller_identity.current.account_id}:inference-profile/us.anthropic.claude-opus-4-6-v1"
         ]
       },
       {
-        # Bedrock Knowledge Base retrieval
         Effect   = "Allow"
         Action   = ["bedrock:Retrieve", "bedrock:RetrieveAndGenerate"]
         Resource = "arn:aws:bedrock:${data.aws_region.current.name}:${data.aws_caller_identity.current.account_id}:knowledge-base/*"
       },
       {
-        # Bedrock Agent invocation
         Effect   = "Allow"
         Action   = ["bedrock:InvokeAgent"]
         Resource = "arn:aws:bedrock:${data.aws_region.current.name}:${data.aws_caller_identity.current.account_id}:agent-alias/*"
@@ -124,9 +137,7 @@ resource "aws_iam_role_policy" "bedrock_invoke" {
   })
 }
 
-# ── 3. Lambda Execution Role ──────────────────────────────────────────────────
-# Used by document ingestion Lambda (Phase 2) — S3 read, DynamoDB write, CloudWatch logs
-
+# ── 4. Lambda Execution Role ──────────────────────────────────────────────────
 resource "aws_iam_role" "lambda_execution" {
   name = "${var.project}-${var.env}-lambda-execution-role"
 
@@ -150,7 +161,6 @@ resource "aws_iam_role_policy" "lambda_execution" {
     Version = "2012-10-17"
     Statement = [
       {
-        # Read raw docs, write to processed bucket
         Effect   = "Allow"
         Action   = ["s3:GetObject", "s3:PutObject", "s3:ListBucket"]
         Resource = [
@@ -161,19 +171,16 @@ resource "aws_iam_role_policy" "lambda_execution" {
         ]
       },
       {
-        # Write chunk metadata to DynamoDB
         Effect   = "Allow"
         Action   = ["dynamodb:PutItem", "dynamodb:UpdateItem", "dynamodb:GetItem"]
         Resource = "arn:aws:dynamodb:${data.aws_region.current.name}:${data.aws_caller_identity.current.account_id}:table/${var.project}-${var.env}-document-metadata"
       },
       {
-        # CloudWatch logs — required for Lambda to write execution logs
         Effect   = "Allow"
         Action   = ["logs:CreateLogGroup", "logs:CreateLogStream", "logs:PutLogEvents"]
         Resource = "arn:aws:logs:${data.aws_region.current.name}:${data.aws_caller_identity.current.account_id}:log-group:/aws/lambda/*"
       },
       {
-        # VPC networking — required when Lambda runs inside VPC
         Effect   = "Allow"
         Action   = ["ec2:CreateNetworkInterface", "ec2:DescribeNetworkInterfaces", "ec2:DeleteNetworkInterface"]
         Resource = "*"
@@ -182,36 +189,12 @@ resource "aws_iam_role_policy" "lambda_execution" {
   })
 }
 
-# Attach Bedrock invoke policy to Lambda execution role
-# Lambda ingestion function also calls Bedrock for chunking
 resource "aws_iam_role_policy_attachment" "lambda_bedrock" {
   role       = aws_iam_role.lambda_execution.name
   policy_arn = aws_iam_policy.bedrock_invoke_managed.arn
 }
 
-resource "aws_iam_policy" "bedrock_invoke_managed" {
-  name = "${var.project}-${var.env}-bedrock-invoke-managed"
-
-  policy = jsonencode({
-    Version = "2012-10-17"
-    Statement = [{
-      Effect = "Allow"
-      Action = ["bedrock:InvokeModel", "bedrock:InvokeModelWithResponseStream"]
-      Resource = [
-        "arn:aws:bedrock:${data.aws_region.current.name}::foundation-model/anthropic.claude-3-5-sonnet-20241022-v2:0",
-        "arn:aws:bedrock:${data.aws_region.current.name}::foundation-model/anthropic.claude-3-haiku-20240307-v1:0",
-        "arn:aws:bedrock:${data.aws_region.current.name}::foundation-model/amazon.nova-pro-v1:0"
-      ]
-    }]
-  })
-
-  tags = var.common_tags
-}
-
-# ── 4. IRSA Role — FastAPI Pod on EKS ────────────────────────────────────────
-# Allows the FastAPI Kubernetes pod to call Bedrock without any hardcoded credentials
-# IRSA = IAM Roles for Service Accounts — pod assumes role via projected service account token
-
+# ── 5. IRSA Role — FastAPI Pod on EKS ────────────────────────────────────────
 resource "aws_iam_role" "fastapi_irsa" {
   name = "${var.project}-${var.env}-fastapi-irsa-role"
 
@@ -223,7 +206,6 @@ resource "aws_iam_role" "fastapi_irsa" {
       Action    = "sts:AssumeRoleWithWebIdentity"
       Condition = {
         StringEquals = {
-          # Scoped to fastapi service account in llmops namespace only
           "${var.eks_oidc_provider}:sub" = "system:serviceaccount:llmops:fastapi-sa"
           "${var.eks_oidc_provider}:aud" = "sts.amazonaws.com"
         }
@@ -246,7 +228,6 @@ resource "aws_iam_role_policy" "fastapi_redis_secrets" {
   policy = jsonencode({
     Version = "2012-10-17"
     Statement = [{
-      # FastAPI reads Redis connection string from Secrets Manager
       Effect   = "Allow"
       Action   = ["secretsmanager:GetSecretValue"]
       Resource = "arn:aws:secretsmanager:${data.aws_region.current.name}:${data.aws_caller_identity.current.account_id}:secret:${var.project}-${var.env}-*"
