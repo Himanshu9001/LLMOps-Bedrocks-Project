@@ -1,0 +1,95 @@
+# Scheduled nightly eval check — triggers fine-tuning if score drops
+# for 3 consecutive days below threshold.
+# This closes the data flywheel loop: bad responses → fine-tune → better model.
+
+name: Fine-tune Trigger
+
+on:
+  schedule:
+    - cron: "0 2 * * *"   # 2 AM UTC daily
+  workflow_dispatch:
+    inputs:
+      force_finetune:
+        description: "Force fine-tuning regardless of score"
+        type: boolean
+        default: false
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  AWS_REGION: "us-east-1"
+  AWS_ACCOUNT_ID: "011528270076"
+
+jobs:
+  check-and-trigger:
+    name: Check eval scores → trigger fine-tune if needed
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::${{ env.AWS_ACCOUNT_ID }}:role/llmops-bedrock-dev-github-actions-role
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install boto3
+
+      - name: Check if fine-tuning should trigger
+        id: check
+        env:
+          EVAL_BUCKET: llmops-bedrock-dev-eval-datasets
+          EVAL_TABLE:  llmops-bedrock-dev-eval-results
+        run: |
+          cd finetuning
+          OUTPUT=$(python prepare_dataset.py 2>&1)
+          echo "$OUTPUT"
+
+          TRIGGER=$(echo "$OUTPUT" | python3 -c "
+          import sys, json
+          for line in sys.stdin:
+              try:
+                  data = json.loads(line)
+                  print(str(data.get('trigger', False)).lower())
+                  break
+              except:
+                  continue
+          " 2>/dev/null || echo "false")
+
+          echo "trigger=$TRIGGER" >> $GITHUB_OUTPUT
+          echo "Force trigger: ${{ github.event.inputs.force_finetune }}"
+
+      - name: Prepare fine-tuning dataset
+        if: steps.check.outputs.trigger == 'true' || github.event.inputs.force_finetune == 'true'
+        id: dataset
+        env:
+          EVAL_BUCKET: llmops-bedrock-dev-eval-datasets
+          EVAL_TABLE:  llmops-bedrock-dev-eval-results
+        run: |
+          cd finetuning
+          DATASET_URI=$(python3 -c "
+          from prepare_dataset import prepare_finetuning_dataset
+          uri = prepare_finetuning_dataset()
+          print(uri)
+          ")
+          echo "dataset_uri=$DATASET_URI" >> $GITHUB_OUTPUT
+          echo "Dataset prepared: $DATASET_URI"
+
+      - name: Summary
+        if: always()
+        run: |
+          echo "## Fine-tune Trigger Summary" >> $GITHUB_STEP_SUMMARY
+          echo "- **Trigger condition met:** ${{ steps.check.outputs.trigger }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Force trigger:** ${{ github.event.inputs.force_finetune }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Dataset:** ${{ steps.dataset.outputs.dataset_uri || 'Not prepared' }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Note:** Actual Bedrock fine-tuning job requires FINETUNE_ROLE_ARN secret" >> $GITHUB_STEP_SUMMARY
