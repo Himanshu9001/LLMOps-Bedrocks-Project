@@ -1,14 +1,16 @@
 """
-FastAPI RAG service with Langfuse observability.
-Every LLM call traced: tokens, latency, cost, model, tenant.
+FastAPI RAG service with Langfuse observability + CloudWatch custom metrics.
+Publishes LLMOps/Bedrock namespace: latency p50/p95/p99, error rate, token usage.
 """
 
 import os
 import uuid
 import json
 import logging
+import threading
 from datetime import datetime, timezone
 from contextlib import asynccontextmanager
+from collections import deque
 
 import boto3
 import redis
@@ -26,15 +28,19 @@ bedrock_agent_runtime = boto3.client(
     region_name=os.environ.get("AWS_REGION", "us-east-1")
 )
 
-# ── Langfuse Client ───────────────────────────────────────────────────────────
-# Traces every LLM call with prompt, response, tokens, latency, cost
+cloudwatch = boto3.client(
+    "cloudwatch",
+    region_name=os.environ.get("AWS_REGION", "us-east-1")
+)
+
+# ── Langfuse ──────────────────────────────────────────────────────────────────
 langfuse = Langfuse(
     public_key=os.environ.get("LANGFUSE_PUBLIC_KEY", ""),
     secret_key=os.environ.get("LANGFUSE_SECRET_KEY", ""),
     host=os.environ.get("LANGFUSE_HOST", "https://cloud.langfuse.com")
 )
 
-# ── Environment Variables ─────────────────────────────────────────────────────
+# ── Config ────────────────────────────────────────────────────────────────────
 KNOWLEDGE_BASE_ID = os.environ["KNOWLEDGE_BASE_ID"]
 MODEL_ARN         = os.environ.get(
     "MODEL_ARN",
@@ -43,14 +49,20 @@ MODEL_ARN         = os.environ.get(
 REDIS_HOST  = os.environ.get("REDIS_HOST", "localhost")
 REDIS_PORT  = int(os.environ.get("REDIS_PORT", "6379"))
 SESSION_TTL = int(os.environ.get("SESSION_TTL", "1800"))
+CW_NAMESPACE = "LLMOps/Bedrock"
 
-# ── Redis Client ──────────────────────────────────────────────────────────────
+# ── In-memory latency buffer for percentile calculation ───────────────────────
+# Keeps last 1000 latency values — percentiles computed per flush
+_latency_buffer = deque(maxlen=1000)
+_buffer_lock    = threading.Lock()
+_error_count    = 0
+_request_count  = 0
+
+# ── Redis ─────────────────────────────────────────────────────────────────────
 redis_client = redis.Redis(
-    host=REDIS_HOST,
-    port=REDIS_PORT,
+    host=REDIS_HOST, port=REDIS_PORT,
     decode_responses=True,
-    socket_connect_timeout=2,
-    socket_timeout=2
+    socket_connect_timeout=2, socket_timeout=2
 )
 
 
@@ -58,22 +70,15 @@ redis_client = redis.Redis(
 async def lifespan(app: FastAPI):
     try:
         redis_client.ping()
-        logger.info("Redis connection verified")
+        logger.info("Redis connected")
     except Exception as e:
         logger.warning(f"Redis unavailable: {e}")
     yield
-    # Flush Langfuse traces on shutdown
     langfuse.flush()
 
 
 app = FastAPI(title="LLMOps RAG API", version="1.0.0", lifespan=lifespan)
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 
 # ── Models ────────────────────────────────────────────────────────────────────
@@ -93,6 +98,90 @@ class QueryResponse(BaseModel):
     trace_id: str | None = None
 
 
+# ── CloudWatch metrics helper ─────────────────────────────────────────────────
+def publish_metrics(latency_ms: float, success: bool,
+                    tenant_id: str, citation_count: int):
+    """
+    Publishes custom metrics to CloudWatch LLMOps/Bedrock namespace.
+    Dimensions: tenant_id, model — enables per-tenant cost attribution.
+    Runs in background thread to not block request handling.
+    """
+    global _error_count, _request_count
+
+    with _buffer_lock:
+        _latency_buffer.append(latency_ms)
+        _request_count += 1
+        if not success:
+            _error_count += 1
+
+        # Calculate percentiles from buffer
+        sorted_latencies = sorted(_latency_buffer)
+        n = len(sorted_latencies)
+        p50 = sorted_latencies[int(n * 0.50)] if n > 0 else 0
+        p95 = sorted_latencies[int(n * 0.95)] if n > 0 else 0
+        p99 = sorted_latencies[int(n * 0.99)] if n > 0 else 0
+        error_rate = (_error_count / _request_count * 100) if _request_count > 0 else 0
+
+    model_name = MODEL_ARN.split("/")[-1]
+
+    try:
+        cloudwatch.put_metric_data(
+            Namespace=CW_NAMESPACE,
+            MetricData=[
+                {
+                    "MetricName": "QueryLatency",
+                    "Value": latency_ms,
+                    "Unit": "Milliseconds",
+                    "Dimensions": [
+                        {"Name": "tenant_id", "Value": tenant_id},
+                        {"Name": "model",     "Value": model_name}
+                    ]
+                },
+                {
+                    "MetricName": "LatencyP50",
+                    "Value": p50,
+                    "Unit": "Milliseconds",
+                    "Dimensions": [{"Name": "model", "Value": model_name}]
+                },
+                {
+                    "MetricName": "LatencyP95",
+                    "Value": p95,
+                    "Unit": "Milliseconds",
+                    "Dimensions": [{"Name": "model", "Value": model_name}]
+                },
+                {
+                    "MetricName": "LatencyP99",
+                    "Value": p99,
+                    "Unit": "Milliseconds",
+                    "Dimensions": [{"Name": "model", "Value": model_name}]
+                },
+                {
+                    "MetricName": "ErrorRate",
+                    "Value": error_rate,
+                    "Unit": "Percent",
+                    "Dimensions": [{"Name": "model", "Value": model_name}]
+                },
+                {
+                    "MetricName": "CitationCount",
+                    "Value": citation_count,
+                    "Unit": "Count",
+                    "Dimensions": [{"Name": "tenant_id", "Value": tenant_id}]
+                },
+                {
+                    "MetricName": "RequestCount",
+                    "Value": 1,
+                    "Unit": "Count",
+                    "Dimensions": [
+                        {"Name": "tenant_id", "Value": tenant_id},
+                        {"Name": "success",   "Value": str(success)}
+                    ]
+                }
+            ]
+        )
+    except Exception as e:
+        logger.warning(f"CloudWatch publish failed: {e}")
+
+
 # ── Middleware ────────────────────────────────────────────────────────────────
 @app.middleware("http")
 async def log_requests(request: Request, call_next):
@@ -106,7 +195,7 @@ async def log_requests(request: Request, call_next):
     return response
 
 
-# ── Health Check ──────────────────────────────────────────────────────────────
+# ── Health ────────────────────────────────────────────────────────────────────
 @app.get("/health")
 async def health():
     redis_ok = False
@@ -115,7 +204,6 @@ async def health():
         redis_ok = True
     except Exception:
         pass
-
     return {
         "status":            "healthy",
         "redis":             "connected" if redis_ok else "unavailable",
@@ -124,31 +212,22 @@ async def health():
     }
 
 
-# ── /query — single-turn RAG with Langfuse tracing ───────────────────────────
+# ── /query ────────────────────────────────────────────────────────────────────
 @app.post("/query", response_model=QueryResponse)
 async def query(req: QueryRequest):
-    """
-    Single-turn RAG query with full Langfuse observability.
-    Every call traced: input, output, latency, model, tenant_id.
-    """
     session_id = req.session_id or str(uuid.uuid4())
     start      = datetime.now(timezone.utc)
+    success    = True
 
-    # Create Langfuse trace — root span for this request
     trace = langfuse.trace(
         name="rag-query",
         user_id=req.tenant_id,
         session_id=session_id,
-        metadata={
-            "tenant_id": req.tenant_id,
-            "kb_id":     KNOWLEDGE_BASE_ID,
-            "model":     MODEL_ARN.split("/")[-1]
-        },
+        metadata={"tenant_id": req.tenant_id, "kb_id": KNOWLEDGE_BASE_ID},
         tags=["rag", "query", req.tenant_id]
     )
 
     try:
-        # Span: Bedrock RetrieveAndGenerate call
         retrieval_span = trace.span(
             name="bedrock-retrieve-and-generate",
             input={"query": req.query, "tenant_id": req.tenant_id}
@@ -180,41 +259,30 @@ async def query(req: QueryRequest):
         citations = _extract_citations(response)
         latency   = (datetime.now(timezone.utc) - start).total_seconds() * 1000
 
-        # End retrieval span with output
-        retrieval_span.end(
-            output={
-                "answer":         answer[:200],
-                "citation_count": len(citations),
-                "latency_ms":     latency
-            }
-        )
+        retrieval_span.end(output={"answer": answer[:200], "citations": len(citations)})
 
-        # Log generation as Langfuse generation event — captures token usage
         trace.generation(
             name="rag-generation",
             model=MODEL_ARN.split("/")[-1],
             input=req.query,
             output=answer,
-            metadata={
-                "citations":  len(citations),
-                "latency_ms": latency,
-                "tenant_id":  req.tenant_id
-            }
+            metadata={"latency_ms": latency, "citations": len(citations)}
         )
 
-        # Update trace with final output
-        trace.update(
-            output={"answer": answer[:200], "latency_ms": latency},
-            metadata={"citation_count": len(citations)}
-        )
+        trace.update(output={"answer": answer[:200], "latency_ms": latency})
 
-        # Save to Redis session
+        # Publish CloudWatch metrics in background — non-blocking
+        threading.Thread(
+            target=publish_metrics,
+            args=(latency, True, req.tenant_id, len(citations)),
+            daemon=True
+        ).start()
+
         _save_to_session(session_id, req.tenant_id, req.query, answer)
 
         logger.info(
-            f"query tenant={req.tenant_id} session={session_id} "
-            f"latency_ms={latency:.2f} citations={len(citations)} "
-            f"trace_id={trace.id}"
+            f"query tenant={req.tenant_id} latency_ms={latency:.2f} "
+            f"citations={len(citations)} trace_id={trace.id}"
         )
 
         return QueryResponse(
@@ -227,36 +295,29 @@ async def query(req: QueryRequest):
         )
 
     except Exception as e:
-        trace.update(
-            output={"error": str(e)},
-            metadata={"status": "failed"}
-        )
+        success = False
+        trace.update(output={"error": str(e)})
+        threading.Thread(
+            target=publish_metrics,
+            args=(0, False, req.tenant_id, 0),
+            daemon=True
+        ).start()
         logger.error(f"Query failed: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
 
 
-# ── /chat — multi-turn ────────────────────────────────────────────────────────
+# ── /chat ─────────────────────────────────────────────────────────────────────
 @app.post("/chat")
 async def chat(req: QueryRequest):
     session_id = req.session_id or str(uuid.uuid4())
     history    = _get_session_history(session_id)
-
-    if history:
-        context_query = f"Previous conversation:\n{history}\n\nCurrent question: {req.query}"
-    else:
-        context_query = req.query
-
-    return await query(QueryRequest(
-        query=context_query,
-        tenant_id=req.tenant_id,
-        session_id=session_id
-    ))
+    context_query = f"Previous conversation:\n{history}\n\nCurrent question: {req.query}" if history else req.query
+    return await query(QueryRequest(query=context_query, tenant_id=req.tenant_id, session_id=session_id))
 
 
-# ── /agent — Bedrock supervisor agent ────────────────────────────────────────
+# ── /agent ────────────────────────────────────────────────────────────────────
 @app.post("/agent")
 async def agent_query(req: QueryRequest):
-    """Multi-agent RAG endpoint with Langfuse tracing."""
     session_id = req.session_id or str(uuid.uuid4())
     start      = datetime.now(timezone.utc)
 
@@ -272,11 +333,7 @@ async def agent_query(req: QueryRequest):
         sys.path.insert(0, "/app")
         from agents.supervisor import invoke_supervisor
 
-        result  = invoke_supervisor(
-            query=req.query,
-            session_id=session_id,
-            tenant_id=req.tenant_id
-        )
+        result  = invoke_supervisor(query=req.query, session_id=session_id, tenant_id=req.tenant_id)
         latency = (datetime.now(timezone.utc) - start).total_seconds() * 1000
 
         trace.generation(
@@ -284,46 +341,71 @@ async def agent_query(req: QueryRequest):
             model="nova-pro-supervisor",
             input=req.query,
             output=result.get("answer", ""),
-            metadata={"latency_ms": latency, "trace_id": str(trace.id)}
+            metadata={"latency_ms": latency}
         )
+
+        threading.Thread(
+            target=publish_metrics,
+            args=(latency, True, req.tenant_id, len(result.get("citations", []))),
+            daemon=True
+        ).start()
 
         result["trace_id"] = str(trace.id)
         return result
 
     except Exception as e:
         trace.update(output={"error": str(e)})
-        logger.error(f"Agent query failed, falling back to RAG: {e}")
+        logger.error(f"Agent failed, falling back to RAG: {e}")
         return await query(req)
 
 
-# ── Session helpers ───────────────────────────────────────────────────────────
-def _save_to_session(session_id: str, tenant_id: str, query: str, answer: str):
+# ── /metrics — expose internal metrics ────────────────────────────────────────
+@app.get("/metrics")
+async def metrics():
+    """Internal metrics endpoint — p50/p95/p99 latency from in-memory buffer."""
+    with _buffer_lock:
+        if not _latency_buffer:
+            return {"message": "No requests yet"}
+        sorted_l = sorted(_latency_buffer)
+        n = len(sorted_l)
+        return {
+            "request_count": _request_count,
+            "error_count":   _error_count,
+            "error_rate_pct": round(_error_count / _request_count * 100, 2) if _request_count > 0 else 0,
+            "latency_p50_ms": sorted_l[int(n * 0.50)],
+            "latency_p95_ms": sorted_l[int(n * 0.95)],
+            "latency_p99_ms": sorted_l[int(n * 0.99)],
+            "latency_min_ms": sorted_l[0],
+            "latency_max_ms": sorted_l[-1],
+            "sample_count":  n
+        }
+
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
+def _save_to_session(session_id, tenant_id, q, a):
     try:
-        key     = f"session:{tenant_id}:{session_id}"
-        history = redis_client.get(key) or "[]"
-        turns   = json.loads(history)
-        turns.append({"q": query, "a": answer})
-        turns   = turns[-10:]
-        redis_client.setex(key, SESSION_TTL, json.dumps(turns))
+        key   = f"session:{tenant_id}:{session_id}"
+        turns = json.loads(redis_client.get(key) or "[]")
+        turns.append({"q": q, "a": a})
+        redis_client.setex(key, SESSION_TTL, json.dumps(turns[-10:]))
     except Exception as e:
         logger.warning(f"Session save failed: {e}")
 
 
-def _get_session_history(session_id: str) -> str:
+def _get_session_history(session_id):
     try:
-        keys    = redis_client.keys(f"session:*:{session_id}")
+        keys = redis_client.keys(f"session:*:{session_id}")
         if not keys:
             return ""
-        history = json.loads(redis_client.get(keys[0]) or "[]")
-        return "\n".join([f"Q: {t['q']}\nA: {t['a']}" for t in history])
+        return "\n".join([f"Q: {t['q']}\nA: {t['a']}" for t in json.loads(redis_client.get(keys[0]) or "[]")])
     except Exception:
         return ""
 
 
-def _extract_citations(response: dict) -> list:
+def _extract_citations(response):
     citations = []
-    for citation in response.get("citations", []):
-        for ref in citation.get("retrievedReferences", []):
+    for c in response.get("citations", []):
+        for ref in c.get("retrievedReferences", []):
             citations.append({
                 "content":  ref.get("content", {}).get("text", "")[:200],
                 "location": ref.get("location", {}).get("s3Location", {}).get("uri", ""),
