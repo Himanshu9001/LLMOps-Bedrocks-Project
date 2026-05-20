@@ -52,3 +52,11 @@ output "knowledge_base_id" {
 output "opensearch_endpoint" {
   value = module.bedrock.opensearch_collection_endpoint
 }
+
+output "ingestion_function_name" {
+  value = module.lambda_ingestion.function_name
+}
+
+output "ecr_repo_url" {
+  value = module.lambda_ingestion.ecr_repo_url
+}

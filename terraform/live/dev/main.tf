@@ -105,3 +105,18 @@ module "bedrock" {
   env         = var.env
   common_tags = local.common_tags
 }
+
+module "lambda_ingestion" {
+  source                   = "../../modules/lambda_ingestion"
+  project                  = var.project
+  env                      = var.env
+  vpc_id                   = module.vpc.vpc_id
+  private_subnet_ids       = module.vpc.private_subnet_ids
+  lambda_execution_role_arn = module.iam.lambda_execution_role_arn
+  knowledge_base_id        = module.bedrock.knowledge_base_id
+  data_source_id           = module.bedrock.data_source_id
+  raw_bucket_id            = module.s3.raw_bucket_id
+  processed_bucket         = module.s3.bucket_ids["processed"]
+  metadata_table           = module.dynamodb.document_metadata_table
+  common_tags              = local.common_tags
+}
