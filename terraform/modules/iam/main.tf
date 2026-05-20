@@ -243,3 +243,17 @@ resource "aws_iam_role_policy" "fastapi_redis_secrets" {
     }]
   })
 }
+
+resource "aws_iam_role_policy" "fastapi_kb_retrieval" {
+  name = "${var.project}-${var.env}-fastapi-kb-retrieval-policy"
+  role = aws_iam_role.fastapi_irsa.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect   = "Allow"
+      Action   = ["bedrock:RetrieveAndGenerate", "bedrock:Retrieve"]
+      Resource = "arn:aws:bedrock:${data.aws_region.current.name}:${data.aws_caller_identity.current.account_id}:knowledge-base/*"
+    }]
+  })
+}
