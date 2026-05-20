@@ -184,6 +184,15 @@ resource "aws_iam_role_policy" "lambda_execution" {
         Effect   = "Allow"
         Action   = ["ec2:CreateNetworkInterface", "ec2:DescribeNetworkInterfaces", "ec2:DeleteNetworkInterface"]
         Resource = "*"
+      },
+      {
+        Effect   = "Allow"
+        Action   = [
+          "bedrock:StartIngestionJob",
+          "bedrock:GetIngestionJob",
+          "bedrock:ListIngestionJobs"
+        ]
+        Resource = "arn:aws:bedrock:${data.aws_region.current.name}:${data.aws_caller_identity.current.account_id}:knowledge-base/*"
       }
     ]
   })
