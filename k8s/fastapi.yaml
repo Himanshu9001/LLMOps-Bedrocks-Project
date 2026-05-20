@@ -63,3 +63,9 @@ spec:
       port: 80
       targetPort: 8000
   type: ClusterIP
+            - name: LANGFUSE_PUBLIC_KEY
+              value: "pk-lf-5fed4d2e-c1a1-434c-8475-a03edfbb1782"
+            - name: LANGFUSE_SECRET_KEY
+              value: "sk-lf-32289de0-06f2-4f38-9e21-b334fd993219"
+            - name: LANGFUSE_HOST
+              value: "https://cloud.langfuse.com"
