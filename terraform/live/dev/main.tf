@@ -97,3 +97,11 @@ module "eks" {
   private_subnet_ids = module.vpc.private_subnet_ids
   common_tags        = local.common_tags
 }
+
+
+module "bedrock" {
+  source      = "../../modules/bedrock"
+  project     = var.project
+  env         = var.env
+  common_tags = local.common_tags
+}

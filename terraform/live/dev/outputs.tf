@@ -44,3 +44,11 @@ output "eks_cluster_name" {
 output "eks_oidc_provider_arn" {
   value = module.eks.oidc_provider_arn
 }
+
+output "knowledge_base_id" {
+  value = module.bedrock.knowledge_base_id
+}
+
+output "opensearch_endpoint" {
+  value = module.bedrock.opensearch_collection_endpoint
+}
