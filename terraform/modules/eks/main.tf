@@ -234,3 +234,39 @@ resource "aws_security_group" "eks_cluster" {
 
   tags = merge(var.common_tags, { Name = "${var.project}-${var.env}-eks-cluster-sg" })
 }
+# ── ALB Controller IAM Role ───────────────────────────────────────────────────
+# Created outside Terraform during initial setup — documented here for reference
+# In production: manage this via eksctl create iamserviceaccount or Terraform
+
+resource "aws_iam_role" "alb_controller" {
+  name = "${var.project_name}-alb-controller-role"
+
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect = "Allow"
+      Principal = {
+        Federated = "arn:aws:iam::${var.aws_account_id}:oidc-provider/${replace(aws_eks_cluster.main.identity[0].oidc[0].issuer, "https://", "")}"
+      }
+      Action = "sts:AssumeRoleWithWebIdentity"
+      Condition = {
+        StringEquals = {
+          "${replace(aws_eks_cluster.main.identity[0].oidc[0].issuer, "https://", "")}:sub" = "system:serviceaccount:kube-system:aws-load-balancer-controller"
+          "${replace(aws_eks_cluster.main.identity[0].oidc[0].issuer, "https://", "")}:aud" = "sts.amazonaws.com"
+        }
+      }
+    }]
+  })
+
+  tags = var.common_tags
+}
+
+resource "aws_iam_role_policy_attachment" "alb_controller_elb" {
+  role       = aws_iam_role.alb_controller.name
+  policy_arn = "arn:aws:iam::aws:policy/ElasticLoadBalancingFullAccess"
+}
+
+resource "aws_iam_role_policy_attachment" "alb_controller_ec2" {
+  role       = aws_iam_role.alb_controller.name
+  policy_arn = "arn:aws:iam::aws:policy/AmazonEC2ReadOnlyAccess"
+}

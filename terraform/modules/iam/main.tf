@@ -257,3 +257,25 @@ resource "aws_iam_role_policy" "fastapi_kb_retrieval" {
     }]
   })
 }
+
+# ── FastAPI IRSA Role — CloudWatch Policy ─────────────────────────────────────
+# Added manually during Phase 7 — consolidated here for reference
+
+resource "aws_iam_role_policy" "fastapi_irsa_cloudwatch" {
+  name = "${var.project_name}-fastapi-cloudwatch-policy"
+  role = aws_iam_role.fastapi_irsa.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect   = "Allow"
+      Action   = ["cloudwatch:PutMetricData"]
+      Resource = "*"
+      Condition = {
+        StringEquals = {
+          "cloudwatch:namespace" = "LLMOps/Bedrock"
+        }
+      }
+    }]
+  })
+}

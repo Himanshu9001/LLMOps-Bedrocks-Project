@@ -1,0 +1,84 @@
+# Builds ingestion Lambda container, pushes to ECR, updates Lambda function.
+# Triggered on changes to services/ingestion/
+
+name: Lambda Deploy
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "services/ingestion/**"
+  workflow_dispatch:
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  AWS_REGION:      "us-east-1"
+  ECR_REPOSITORY:  "llmops-bedrock-dev-ingestion"
+  LAMBDA_FUNCTION: "llmops-bedrock-dev-ingestion"
+  AWS_ACCOUNT_ID:  "011528270076"
+
+jobs:
+  build-and-deploy:
+    name: Build Lambda Image + Deploy
+    runs-on: ubuntu-latest
+    environment: dev
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::${{ env.AWS_ACCOUNT_ID }}:role/llmops-bedrock-dev-github-actions-role
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build and push Lambda image
+        run: |
+          IMAGE_URI=${{ env.AWS_ACCOUNT_ID }}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com/${{ env.ECR_REPOSITORY }}
+
+          docker buildx build \
+            --platform linux/arm64 \
+            --provenance=false \
+            --sbom=false \
+            --output type=image,push=true,oci-mediatypes=false \
+            -t $IMAGE_URI:${{ github.sha }} \
+            -t $IMAGE_URI:latest \
+            services/ingestion/
+
+          echo "IMAGE_URI=$IMAGE_URI:${{ github.sha }}" >> $GITHUB_ENV
+
+      - name: Run Trivy security scan
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: "${{ env.IMAGE_URI }}"
+          format: "table"
+          exit-code: "0"
+          severity: "CRITICAL,HIGH"
+
+      - name: Update Lambda function
+        run: |
+          aws lambda update-function-code \
+            --function-name ${{ env.LAMBDA_FUNCTION }} \
+            --image-uri ${{ env.IMAGE_URI }} \
+            --region ${{ env.AWS_REGION }}
+
+          # Wait for update to complete
+          aws lambda wait function-updated \
+            --function-name ${{ env.LAMBDA_FUNCTION }} \
+            --region ${{ env.AWS_REGION }}
+
+          echo "Lambda updated: ${{ env.IMAGE_URI }}"
+
+      - name: Post deployment summary
+        run: |
+          echo "## Lambda Deploy Summary" >> $GITHUB_STEP_SUMMARY
+          echo "- **Function:** ${{ env.LAMBDA_FUNCTION }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Image:** ${{ env.IMAGE_URI }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Commit:** ${{ github.sha }}" >> $GITHUB_STEP_SUMMARY
