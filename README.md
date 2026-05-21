@@ -1,3 +1,9 @@
+![Eval Score](https://img.shields.io/badge/Eval%20Score-0.767%20%E2%9C%85-brightgreen)
+![Phases](https://img.shields.io/badge/Phases-10%20Complete-blue)
+![IaC](https://img.shields.io/badge/IaC-Terraform-purple)
+![CI/CD](https://img.shields.io/badge/CI%2FCD-GitHub%20Actions%20OIDC-orange)
+![Platform](https://img.shields.io/badge/Platform-Amazon%20Bedrock-yellow)
+
 # Enterprise LLMOps Platform on Amazon Bedrock
 
 **Author:** Himanshu Singh (Heman) | Cloud DevOps & AI Engineer  

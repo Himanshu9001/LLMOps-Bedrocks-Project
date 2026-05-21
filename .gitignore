@@ -8,3 +8,23 @@ crash.log
 
 # OS
 .DS_Store
+# Terraform
+*.tfvars
+*.tfvars.json
+.terraform/
+.terraform.lock.hcl
+terraform.tfstate
+terraform.tfstate.backup
+crash.log
+
+# Python
+__pycache__/
+*.pyc
+.env
+
+# Mac
+.DS_Store
+
+# k6 results
+load-testing/results.json
+k8s/secrets.yaml

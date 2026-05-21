@@ -31,15 +31,30 @@ spec:
             - name: MODEL_ARN
               value: "arn:aws:bedrock:us-east-1:011528270076:inference-profile/us.amazon.nova-pro-v1:0"
             - name: LANGFUSE_PUBLIC_KEY
-              value: "pk-lf-5fed4d2e-c1a1-434c-8475-a03edfbb1782"
+              valueFrom:
+                secretKeyRef:
+                  name: llmops-secrets
+                  key: langfuse-public-key
             - name: LANGFUSE_SECRET_KEY
-              value: "sk-lf-32289de0-06f2-4f38-9e21-b334fd993219"
+              valueFrom:
+                secretKeyRef:
+                  name: llmops-secrets
+                  key: langfuse-secret-key
             - name: LANGFUSE_HOST
-              value: "https://cloud.langfuse.com"
+              valueFrom:
+                secretKeyRef:
+                  name: llmops-secrets
+                  key: langfuse-host
             - name: GUARDRAIL_ID
-              value: "l85cdv5umyr3"
+              valueFrom:
+                secretKeyRef:
+                  name: llmops-secrets
+                  key: guardrail-id
             - name: GUARDRAIL_VERSION
-              value: "1"
+              valueFrom:
+                secretKeyRef:
+                  name: llmops-secrets
+                  key: guardrail-version
           resources:
             requests:
               cpu: "250m"
